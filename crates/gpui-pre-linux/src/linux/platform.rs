@@ -1409,6 +1409,27 @@ fn guess_ascii(keycode: Keycode, shift: bool) -> Option<char> {
     })
 }
 
+/// XKB physical key names corresponding to US_POSITIONS, independent of compositor keycode allocation.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+const US_KEY_NAMES: [&str; US_POSITIONS.len()] = [
+    "AE01", "AE02", "AE03", "AE04", "AE05", "AE06", "AE07", "AE08", "AE09", "AE10", "AE11", "AE12",
+    "AD01", "AD02", "AD03", "AD04", "AD05", "AD06", "AD07", "AD08", "AD09", "AD10", "AD11", "AD12",
+    "AC01", "AC02", "AC03", "AC04", "AC05", "AC06", "AC07", "AC08", "AC09", "AC10", "AC11", "TLDE",
+    "BKSL", "AB01", "AB02", "AB03", "AB04", "AB05", "AB06", "AB07", "AB08", "AB09", "AB10",
+];
+
+/// Only the compiled map's physical names or aliases establish a US position; numeric keycodes alone do not.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn us_key_from_xkb(keymap: &xkb::Keymap, keycode: Keycode, shift: bool) -> Option<char> {
+    let raw = US_KEY_NAMES
+        .iter()
+        .zip(US_POSITIONS)
+        .find_map(|(name, (raw, _, _))| {
+            (keymap.key_by_name(name) == Some(keycode)).then_some(raw)
+        })?;
+    guess_ascii(Keycode::new(raw), shift)
+}
+
 /// Control codes Ctrl makes from the letters `a` through `z`.
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const CONTROL_LETTERS: std::ops::RangeInclusive<u32> = 0x01..=0x1a;
@@ -1433,23 +1454,26 @@ fn ascii_fallback(key_utf8: &str, key_utf32: u32) -> Option<char> {
 
 /// The US key position of a one-character key name: its keycode, its US character and whether Shift types it.
 #[cfg(any(feature = "wayland", feature = "x11"))]
-fn us_position(key: &str) -> Option<(Keycode, char, bool)> {
+fn us_position(keymap: &xkb::Keymap, key: &str) -> Option<(Keycode, char, bool)> {
     let mut chars = key.chars();
     let target = chars.next().filter(|_| chars.next().is_none())?;
-    US_POSITIONS.iter().find_map(|&(raw, lower, upper)| {
-        if target == lower {
-            Some((Keycode::new(raw), lower, false))
-        } else if target == upper {
-            let us = if lower.is_ascii_alphabetic() {
-                lower
+    US_POSITIONS
+        .iter()
+        .zip(US_KEY_NAMES)
+        .find_map(|(&(_, lower, upper), name)| {
+            if target == lower {
+                Some((keymap.key_by_name(name)?, lower, false))
+            } else if target == upper {
+                let us = if lower.is_ascii_alphabetic() {
+                    lower
+                } else {
+                    upper
+                };
+                Some((keymap.key_by_name(name)?, us, true))
             } else {
-                upper
-            };
-            Some((Keycode::new(raw), us, true))
-        } else {
-            None
-        }
-    })
+                None
+            }
+        })
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1461,7 +1485,27 @@ pub(super) fn keystroke_from_xkb(
     let key_utf32 = state.key_get_utf32(keycode);
     let key_utf8 = state.key_get_utf8(keycode);
     let key_sym = state.key_get_one_sym(keycode);
-    let latin = group_is_latin(&state.get_keymap(), state.key_get_layout(keycode));
+    let keymap = state.get_keymap();
+    let latin = group_is_latin(&keymap, state.key_get_layout(keycode));
+    // Logical controls exclude US metadata; declared mode/dead keys retain the existing physical-layout policy.
+    let scalar = xkb::keysym_to_utf32(key_sym);
+    let logical_key = (scalar != 0
+        && char::from_u32(scalar).is_some_and(|key| key.is_control() || key == ' '))
+        || matches!(
+            key_sym,
+            Keysym::Pause | Keysym::Scroll_Lock | Keysym::Sys_Req | Keysym::ISO_Left_Tab
+        )
+        || key_sym.is_cursor_key()
+        || key_sym.is_keypad_key()
+        || key_sym.is_pf_key()
+        || key_sym.is_function_key()
+        || key_sym.is_misc_function_key()
+        || xkb::keysym_get_name(key_sym).starts_with("XF86");
+    let us_key = if logical_key {
+        None
+    } else {
+        us_key_from_xkb(&keymap, keycode, modifiers.shift)
+    };
 
     let key = match key_sym {
         Keysym::Return => "enter".to_owned(),
@@ -1538,7 +1582,7 @@ pub(super) fn keystroke_from_xkb(
                 // Ctrl turns some digits into control codes; the keysym still names the key.
                 key.to_ascii_lowercase().to_string()
             } else if let Some(key) = ascii_fallback(&key_utf8, key_utf32)
-                .or_else(|| guess_ascii(keycode, modifiers.shift))
+                .or(us_key)
                 .filter(|key| !(latin && group_prints(state, keycode, *key)))
             {
                 // A Latin group keeps the keysym name when another key prints this character.
@@ -1550,9 +1594,11 @@ pub(super) fn keystroke_from_xkb(
     };
 
     // A non-Latin group reports the US key at each main-block position, so shortcuts keep their physical keys.
-    let us_key = guess_ascii(keycode, modifiers.shift).map(String::from);
+    let us_key = us_key.map(String::from);
+    let printed_ascii_letter =
+        char::from_u32(xkb::keysym_to_utf32(key_sym)).is_some_and(|key| key.is_ascii_alphabetic());
     let key = match &us_key {
-        Some(us) if !latin => us.clone(),
+        Some(us) if !latin && !printed_ascii_letter => us.clone(),
         _ => key,
     };
 
@@ -1710,9 +1756,9 @@ const US_POSITIONS: [(u32, char, char); 47] = [
     (61, '/', '?'),
 ];
 
-/// Evdev keycodes of the letter rows AD01 to AD12, AC01 to AC11 and AB01 to AB10.
+/// XKB physical letter rows AD01 to AD12, AC01 to AC11 and AB01 to AB10.
 #[cfg(any(feature = "wayland", feature = "x11"))]
-const LETTER_ROWS: [std::ops::RangeInclusive<u32>; 3] = [24..=35, 38..=48, 52..=61];
+const LETTER_ROWS: [&str; 3] = ["AD", "AC", "AB"];
 
 /// One bit for each of the 26 ASCII letters.
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1722,8 +1768,14 @@ const ALL_LETTERS: u32 = (1 << 26) - 1;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn group_is_latin(keymap: &xkb::Keymap, layout: xkb::LayoutIndex) -> bool {
     let mut letters = 0u32;
-    for raw in LETTER_ROWS.into_iter().flatten() {
-        for sym in keymap.key_get_syms_by_level(Keycode::new(raw), layout, 0) {
+    for name in US_KEY_NAMES
+        .iter()
+        .filter(|name| LETTER_ROWS.iter().any(|row| name.starts_with(*row)))
+    {
+        let Some(code) = keymap.key_by_name(name) else {
+            continue;
+        };
+        for sym in keymap.key_get_syms_by_level(code, layout, 0) {
             if let Some(letter) =
                 char::from_u32(xkb::keysym_to_utf32(*sym)).filter(char::is_ascii_lowercase)
             {
@@ -1882,7 +1934,10 @@ impl LinuxKeyboardMapper {
             key_equivalents: collections::HashMap::default(),
         };
         let mut key_equivalents = collections::HashMap::default();
-        for &(raw, lower, upper) in &US_POSITIONS {
+        for (&(_, lower, upper), name) in US_POSITIONS.iter().zip(US_KEY_NAMES) {
+            let Some(code) = mapper.keymap.key_by_name(name) else {
+                continue;
+            };
             for (us, shift) in [(lower, false), (upper, true)] {
                 if lower.is_ascii_alphabetic() && (shift || latin) {
                     continue;
@@ -1891,7 +1946,7 @@ impl LinuxKeyboardMapper {
                     shift,
                     ..Default::default()
                 };
-                let event = mapper.event(Keycode::new(raw), modifiers);
+                let event = mapper.event(code, modifiers);
                 let mut chars = event.key.chars();
                 if let Some(key) = chars.next().filter(|_| chars.next().is_none())
                     && key != us
@@ -2004,7 +2059,7 @@ impl PlatformKeyboardMapper for LinuxKeyboardMapper {
         use_key_equivalents: bool,
     ) -> gpui::KeybindingKeystroke {
         // Letters on a Latin group always match where they are printed.
-        let position = us_position(&keystroke.key)
+        let position = us_position(&self.keymap, &keystroke.key)
             .filter(|(_, us, _)| !(self.latin && us.is_ascii_alphabetic()));
         let (true, Some((keycode, us, level_shift))) = (use_key_equivalents, position) else {
             return gpui::KeybindingKeystroke::from_keystroke(keystroke);
@@ -2014,6 +2069,9 @@ impl PlatformKeyboardMapper for LinuxKeyboardMapper {
             ..keystroke.modifiers
         };
         let event = self.event(keycode, held);
+        if event.us_key.is_none() || (us.is_ascii_alphabetic() && event.key != us.to_string()) {
+            return gpui::KeybindingKeystroke::from_keystroke(keystroke);
+        }
         let keycap = self.keycap(keycode, us, held.shift, &event);
         let inner = gpui::Keystroke {
             key_char: None,
@@ -2704,6 +2762,294 @@ mod i50_xkb_tests {
         fn identity_of(&self) -> KeyboardLayoutIdentity {
             KeyboardLayoutIdentity::parse(self.id()).expect("a Linux layout id is an identity")
         }
+    }
+
+    fn sparse_keymap(source: &str) -> xkb::Keymap {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        xkb::Keymap::new_from_string(
+            &context,
+            source.into(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        )
+        .expect("actual sparse compositor keymap")
+    }
+
+    const SPARSE_ESCAPE_SPACE: &str = r#"xkb_keymap {
+xkb_keycodes "(unnamed)" { minimum = 8; maximum = 255; <K1> = 9; <K2> = 10; };
+xkb_types "(unnamed)" { include "complete" };
+xkb_compatibility "(unnamed)" { include "complete" };
+xkb_symbols "(unnamed)" { key <K1> {[ Escape ]}; key <K2> {[ space ]}; };
+};"#;
+
+    #[test]
+    fn sparse_xkb_escape_space_preserve_native_and_public_translation() {
+        let keymap = sparse_keymap(SPARSE_ESCAPE_SPACE);
+        assert!(!group_is_latin(&keymap, 0));
+        let escape = press(&keymap, 0, &[], "K1");
+        assert_eq!(escape.key, "escape");
+        assert_eq!(escape.us_key, None);
+        let space = press(&keymap, 0, &[], "K2");
+        assert_eq!(space.key_char.as_deref(), Some(" "));
+        assert_eq!(
+            space.key, "space",
+            "Wayland code2/XKB10 is logical Space, not guessed digit1"
+        );
+        assert_eq!(
+            space.us_key, None,
+            "anonymous K2 declares no US physical position"
+        );
+        assert!(space.should_match(&gpui::KeybindingKeystroke::from_keystroke(binding("space"))));
+        let samples = raw_samples(&layout_at(&keymap, 0), Modifiers::none(), false);
+        assert!(samples.contains(&(escape, Modifiers::none())));
+        assert!(samples.contains(&(space, Modifiers::none())));
+        assert!(!samples.iter().any(|(event, _)| event.us_key.is_some()));
+        eprintln!(
+            "SPARSE_COMPILED_XKB_BEGIN\n{}\nSPARSE_COMPILED_XKB_END",
+            keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        );
+    }
+
+    #[test]
+    fn sparse_xkb_named_keys_keep_logical_semantics_at_main_block_codes() {
+        for (sym, expected) in [
+            ("space", "space"),
+            ("Escape", "escape"),
+            ("Return", "enter"),
+            ("Tab", "tab"),
+            ("ISO_Left_Tab", "tab"),
+            ("Left", "left"),
+            ("Right", "right"),
+            ("Up", "up"),
+            ("Down", "down"),
+            ("Home", "home"),
+            ("End", "end"),
+            ("Prior", "pageup"),
+            ("Next", "pagedown"),
+            ("Insert", "insert"),
+            ("Delete", "delete"),
+            ("BackSpace", "backspace"),
+            ("F1", "f1"),
+            ("XF86AudioMute", "xf86audiomute"),
+            ("KP_Enter", "enter"),
+        ] {
+            for name in ["K2", "AE01"] {
+                let source = SPARSE_ESCAPE_SPACE
+                    .replace("K2", name)
+                    .replace("[ space ]", &format!("[ {sym} ]"));
+                let keymap = sparse_keymap(&source);
+                for mods in SHORTCUT_MODS {
+                    let event = press(&keymap, 0, mods, name);
+                    assert_eq!(event.key, expected, "{sym} at {name} {mods:?}");
+                    assert_eq!(
+                        event.us_key, None,
+                        "logical named {sym} has no printable US input"
+                    );
+                    assert_eq!(
+                        event.modifiers,
+                        modifiers(mods),
+                        "named keys retain held modifiers"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_xkb_anonymous_printed_keys_keep_text_without_physical_metadata() {
+        for (symbol, key, text) in [
+            ("a", "a", "a"),
+            ("b", "b", "b"),
+            ("3", "3", "3"),
+            ("exclam", "!", "!"),
+            ("quotedbl", "\"", "\""),
+            ("backslash", "\\", "\\"),
+            ("Cyrillic_ya", "cyrillic_ya", "я"),
+        ] {
+            let source = SPARSE_ESCAPE_SPACE.replace("[ space ]", &format!("[ {symbol} ]"));
+            let keymap = sparse_keymap(&source);
+            let event = press(&keymap, 0, &[], "K2");
+            assert_eq!(event.key, key, "anonymous {symbol}");
+            assert_eq!(event.key_char.as_deref(), Some(text));
+            assert_eq!(event.us_key, None);
+            assert!(
+                raw_samples(&layout_at(&keymap, 0), Modifiers::none(), false)
+                    .contains(&(event, Modifiers::none()))
+            );
+        }
+    }
+
+    fn relocate_compiled_keycodes(keymap: &xkb::Keymap) -> xkb::Keymap {
+        const OFFSET: u32 = 100;
+        let source = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        // Compiled keycode row: "<AD01> = 24;", with numeric minimum/maximum bounds and named aliases.
+        let relocated = source
+            .lines()
+            .map(|line| {
+                let Some((left, right)) = line.split_once('=') else {
+                    return line.to_owned();
+                };
+                let name = left.trim();
+                if !(name.starts_with('<') || ["minimum", "maximum"].contains(&name)) {
+                    return line.to_owned();
+                }
+                let Ok(raw) = right.trim().trim_end_matches(';').parse::<u32>() else {
+                    return line.to_owned();
+                };
+                format!("{left}= {};", raw + OFFSET)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sparse_keymap(&relocated)
+    }
+
+    #[test]
+    fn sparse_xkb_relocated_complete_maps_preserve_native_translation() {
+        for (layout, variant) in [("us", "dvorak"), ("gb,ru", "")] {
+            let original = pc105(layout, variant);
+            let relocated = relocate_compiled_keycodes(&original);
+            assert!(code(&relocated, "AD01").raw() > 100);
+            for group in 0..original.num_layouts() {
+                for name in US_KEY_NAMES {
+                    for mods in SHORTCUT_MODS {
+                        let expected = press(&original, group, mods, name);
+                        let actual = press(&relocated, group, mods, name);
+                        assert_eq!(
+                            actual, expected,
+                            "{layout}({variant}) group {group} {name} {mods:?}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    group_is_latin(&relocated, group),
+                    group_is_latin(&original, group)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_xkb_named_controls_do_not_create_printable_bindings() {
+        for (sym, expected) in [
+            ("space", "space"),
+            ("Return", "enter"),
+            ("Left", "left"),
+            ("F1", "f1"),
+        ] {
+            let source = SPARSE_ESCAPE_SPACE
+                .replace("K2", "AE01")
+                .replace("[ space ]", &format!("[ {sym} ]"));
+            let keymap = sparse_keymap(&source);
+            let mapper = layout_at(&keymap, 0).mapper();
+            let native = press(&keymap, 0, &[], "AE01");
+            assert_eq!(native.key, expected);
+            assert!(native.us_key.is_none());
+            let literal = binding("1");
+            let target = mapper.map_key_equivalent(literal.clone(), true);
+            assert_eq!(
+                target,
+                gpui::KeybindingKeystroke::from_keystroke(literal),
+                "a named {sym} is not a printable physical binding"
+            );
+            assert!(!native.should_match(&target));
+            assert!(native.should_match(&mapper.map_key_equivalent(binding(expected), true)));
+        }
+    }
+
+    #[test]
+    fn sparse_xkb_misc_controls_preserve_logical_translation_and_bindings() {
+        assert_eq!(xkb::keysym_to_utf32(Keysym::Pause), 0);
+        assert!(!Keysym::Pause.is_misc_function_key());
+        for (symbol, expected) in [
+            ("Pause", "pause"),
+            ("Scroll_Lock", "scroll_lock"),
+            ("Sys_Req", "sys_req"),
+        ] {
+            for name in ["AE01", "K2"] {
+                let source = SPARSE_ESCAPE_SPACE
+                    .replace("K2", name)
+                    .replace("[ space ]", &format!("[ {symbol} ]"));
+                let keymap = sparse_keymap(&source);
+                let mapper = layout_at(&keymap, 0).mapper();
+                for mods in SHORTCUT_MODS {
+                    let held = modifiers(mods);
+                    let event = press(&keymap, 0, mods, name);
+                    assert_eq!(event.key, expected, "logical {symbol} at {name} {mods:?}");
+                    assert_eq!(event.us_key, None);
+                    assert_eq!(event.key_char, None);
+                    assert_eq!(event.modifiers, held);
+                    assert!(
+                        raw_samples(&layout_at(&keymap, 0), held, false).contains(&(event, held))
+                    );
+                }
+                assert_eq!(
+                    mapper.map_key_equivalent(binding("1"), true).inner().key,
+                    "1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_xkb_physical_metadata_comes_from_compiled_key_names() {
+        let named = SPARSE_ESCAPE_SPACE
+            .replace("K2", "AD01")
+            .replace("[ space ]", "[ Cyrillic_ya ]");
+        let keymap = sparse_keymap(&named);
+        let event = press(&keymap, 0, &[], "AD01");
+        assert_eq!(
+            code(&keymap, "AD01").raw(),
+            10,
+            "physical name is independent of numeric evdev guess"
+        );
+        assert_eq!(event.key_char.as_deref(), Some("я"));
+        assert_eq!(event.us_key.as_deref(), Some("q"));
+        assert_eq!(event.key, "q");
+        assert!(
+            event.should_match(&mapped(&keymap, 0, "q", true)),
+            "mapper bindings resolve the same declared physical key"
+        );
+        let alias_source = named
+            .replace("AD01", "K2")
+            .replace("<K2> = 10;", "<K2> = 10; alias <AD01> = <K2>;");
+        let alias_map = sparse_keymap(&alias_source);
+        assert_eq!(
+            press(&alias_map, 0, &[], "K2"),
+            event,
+            "a declared physical alias has the same authority"
+        );
+        let anonymous = sparse_keymap(&named.replace("AD01", "K2"));
+        let raw = press(&anonymous, 0, &[], "K2");
+        assert_eq!(raw.key_char.as_deref(), Some("я"));
+        assert_eq!(
+            raw.us_key, None,
+            "unknown physical provenance stays unsupported"
+        );
+        assert_eq!(raw.key, "cyrillic_ya");
+        let latin = sparse_keymap(&named.replace("Cyrillic_ya", "x"));
+        assert!(
+            !group_is_latin(&latin, 0),
+            "incomplete Latin coverage is not a complete Latin group"
+        );
+        let letter = press(&latin, 0, &[], "AD01");
+        assert_eq!(
+            letter.key, "x",
+            "the actual ASCII letter stays logical despite incomplete coverage"
+        );
+        assert_eq!(letter.key_char.as_deref(), Some("x"));
+        assert_eq!(
+            letter.us_key.as_deref(),
+            Some("q"),
+            "only declared physical metadata remains available"
+        );
+        let q = mapped(&latin, 0, "q", true);
+        assert_eq!(
+            q.inner().key,
+            "q",
+            "an incomplete Latin map does not move a logical letter binding to another printed letter"
+        );
+        assert!(!letter.should_match(&q));
+        assert!(letter.should_match(&mapped(&latin, 0, "x", true)));
     }
 
     fn raw_samples(
