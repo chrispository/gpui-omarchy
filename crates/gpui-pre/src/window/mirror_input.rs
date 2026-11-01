@@ -21,11 +21,36 @@ pub(crate) struct MirrorInput {
     pub(crate) listeners: Vec<Option<usize>>,
     pub(crate) node_scopes: FxHashMap<DispatchNodeId, usize>,
     pub(crate) deferred_parents: Vec<(DispatchNodeId, usize)>,
-    pending_parents: FxHashMap<DispatchNodeId, usize>,
+    pub(crate) pending_parents: FxHashMap<DispatchNodeId, usize>,
     pub(crate) quads: Vec<MirrorQuad>,
 }
 
 impl MirrorInput {
+    /// Empties every table but keeps its capacity, so a steady frame allocates nothing here.
+    pub(crate) fn clear(&mut self) {
+        // No `..` here, so a new field fails to compile until this resets it.
+        let Self {
+            enabled,
+            width,
+            scopes,
+            hits,
+            listeners,
+            node_scopes,
+            deferred_parents,
+            pending_parents,
+            quads,
+        } = self;
+        *enabled = false;
+        *width = Pixels::default();
+        scopes.clear();
+        hits.clear();
+        listeners.clear();
+        node_scopes.clear();
+        deferred_parents.clear();
+        pending_parents.clear();
+        quads.clear();
+    }
+
     pub(crate) fn deferred_parent_scope(&mut self, node: DispatchNodeId) -> usize {
         if let Some(scope) = self
             .node_scopes

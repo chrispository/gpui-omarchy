@@ -386,6 +386,66 @@ fn a_window_that_stops_mirroring_paints_as_before(cx: &mut TestAppContext) {
     assert_eq!(origins[2], origins[0]);
 }
 
+/// Length and capacity of every table in a frame's mirror input.
+fn mirror_tables(input: &super::mirror_input::MirrorInput) -> [(usize, usize); 7] {
+    [
+        (input.scopes.len(), input.scopes.capacity()),
+        (input.hits.len(), input.hits.capacity()),
+        (input.listeners.len(), input.listeners.capacity()),
+        (input.node_scopes.len(), input.node_scopes.capacity()),
+        (
+            input.deferred_parents.len(),
+            input.deferred_parents.capacity(),
+        ),
+        (
+            input.pending_parents.len(),
+            input.pending_parents.capacity(),
+        ),
+        (input.quads.len(), input.quads.capacity()),
+    ]
+}
+
+#[gpui::test]
+fn a_cleared_frame_keeps_its_mirror_tables(cx: &mut TestAppContext) {
+    let handle = cx.add_window(|_, _| {
+        Paint(Rc::new(|window, _| {
+            for _ in 0..4 {
+                window.on_mouse_event(|_: &MouseExitEvent, _, _, _| {});
+            }
+            window.with_unmirrored(bounds(10., 0., 100., 20.), |window| {
+                window.paint_quad(fill(bounds(10., 0., 20., 20.), red()));
+            });
+            window.paint_quad(fill(bounds(10., 40., 20., 20.), red()));
+        }))
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.set_layout_mirrored(true);
+        for _ in 0..2 {
+            window.draw(cx).clear(cx);
+        }
+        // This scene leaves hits and the deferred tables empty, so they are filled by hand.
+        let node = window.rendered_frame.dispatch_tree.root_node_id();
+        let input = &mut window.rendered_frame.mirror_input;
+        input.stamp(0, 0, bounds(10., 0., 20., 20.));
+        input.deferred_parents.push((node, 0));
+        input.pending_parents.insert(node, 0);
+        assert!(input.enabled && input.width > px(0.));
+        let before = mirror_tables(input);
+        assert!(before.iter().all(|&(len, _)| len > 0), "{before:?}");
+        // Every draw clears the frame it just swapped out, as here.
+        window.rendered_frame.clear();
+        let input = &window.rendered_frame.mirror_input;
+        assert!(!input.enabled && input.width == px(0.));
+        let after = mirror_tables(input);
+        assert_eq!(
+            after,
+            before.map(|(_, capacity)| (0, capacity)),
+            "a steady frame refills its tables without allocating"
+        );
+    })
+    .unwrap();
+}
+
 #[path = "mirror_text_tests.rs"]
 mod text;
 

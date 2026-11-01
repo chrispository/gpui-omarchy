@@ -1180,7 +1180,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.mirror_units.clear();
-        self.mirror_input = MirrorInput::default();
+        self.mirror_input.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
