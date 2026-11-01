@@ -417,7 +417,10 @@ impl TestWindow {
     }
 
     /// Installs platform-specific cancellation delivery for native drag regression tests.
-    pub fn set_cancel_external_drag_handler(&self, handler: impl FnMut(&TestWindow) -> bool + 'static) {
+    pub fn set_cancel_external_drag_handler(
+        &self,
+        handler: impl FnMut(&TestWindow) -> bool + 'static,
+    ) {
         self.0.lock().cancel_external_drag_handler = Some(Box::new(handler));
     }
 

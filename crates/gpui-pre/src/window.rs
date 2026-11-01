@@ -14,15 +14,15 @@ use crate::{
     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayout,
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PresentedFrames, Priority,
-    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
-    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PresentedFrames, Primitive,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
@@ -69,6 +69,14 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 #[cfg(test)]
 mod glyph_run_tests;
+mod mirror;
+mod mirror_coordinates;
+mod mirror_dash;
+mod mirror_event;
+mod mirror_input;
+mod mirror_quad;
+#[cfg(test)]
+mod mirror_tests;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -76,6 +84,10 @@ pub use a11y::A11ySubtreeBuilder;
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use self::mirror::{Mirror, MirrorUnit};
+use self::mirror_coordinates::MirrorCapture;
+use self::mirror_input::MirrorInput;
+use self::mirror_quad::MirrorQuad;
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -748,6 +760,7 @@ pub(crate) struct CursorStyleRequest {
 #[derive(Default, Eq, PartialEq)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
+    pub(crate) indices: SmallVec<[usize; 8]>,
     pub(crate) hover_hitbox_count: usize,
 }
 
@@ -871,7 +884,25 @@ impl Hitbox {
     /// Checks whether this hitbox would be hovered at `position`, regardless of the current input
     /// modality or mouse position.
     pub fn is_hovered_at(&self, position: Point<Pixels>, window: &Window) -> bool {
-        let hit_test = window.rendered_frame.hit_test(position);
+        let frame = if window.mirror.scope.is_some() {
+            &window.next_frame
+        } else {
+            &window.rendered_frame
+        };
+        let position = if window.mirror.enabled {
+            let scope = frame.mirror_input.hit_scope(&frame.hitboxes, self.id);
+            frame
+                .mirror_input
+                .physical_bounds(
+                    Bounds::new(position, Size::default()),
+                    scope,
+                    &frame.mirror_units,
+                )
+                .origin
+        } else {
+            position
+        };
+        let hit_test = frame.hit_test(position);
         hit_test
             .ids
             .iter()
@@ -1054,6 +1085,10 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// Regions painted left to right in a mirrored window, for pointer and IME mapping.
+    pub(crate) mirror_units: Vec<MirrorUnit>,
+    /// Physical hit geometry and paint ownership, separate from logical receiver coordinates.
+    pub(crate) mirror_input: MirrorInput,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1083,6 +1118,12 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    mirror_units_index: usize,
+    mirror_quads_index: usize,
+    mirror_hitbox_end: usize,
+    mirror_hitbox_start: usize,
+    mirror_scope: Option<usize>,
+    mirror_scopes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1111,6 +1152,8 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            mirror_units: Vec::new(),
+            mirror_input: MirrorInput::default(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1136,6 +1179,8 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.mirror_units.clear();
+        self.mirror_input = MirrorInput::default();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -1171,12 +1216,26 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+        self.hit_test_indices(position, 0..self.hitboxes.len())
+    }
+
+    fn hit_test_indices(
+        &self,
+        position: Point<Pixels>,
+        indices: impl DoubleEndedIterator<Item = usize>,
+    ) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+        for index in indices.rev() {
+            let hitbox = &self.hitboxes[index];
+            let bounds = if self.mirror_input.enabled {
+                self.mirror_input.bounds(index, hitbox)
+            } else {
+                hitbox.bounds.intersect(&hitbox.content_mask.bounds)
+            };
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
+                hit_test.indices.push(index);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
                 {
@@ -1248,6 +1307,7 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    mirror: Mirror,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -1315,6 +1375,7 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    captured_mirror: Option<MirrorCapture>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -2160,6 +2221,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            mirror: Mirror::default(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -2220,6 +2282,7 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            captured_mirror: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -3482,7 +3545,16 @@ impl Window {
         exclusions: &[Range<ScaledPixels>],
     ) {
         self.invalidator.debug_assert_paint();
-        let underline = self.underline(origin, width, style);
+        let mut underline = self.underline(origin, width, style);
+        let exclusions: SmallVec<[Range<ScaledPixels>; 4]> = if self.mirror.enabled {
+            self.mirror.underline(&mut underline, self.mirror_mask());
+            exclusions
+                .iter()
+                .map(|span| self.mirror.scaled_span(span.clone()))
+                .collect()
+        } else {
+            exclusions.iter().cloned().collect()
+        };
         if exclusions.is_empty() {
             self.next_frame.scene.insert_primitive(underline);
             return;
@@ -3590,6 +3662,88 @@ impl Window {
         }
     }
 
+    fn mirror_mask(&self) -> ContentMask<ScaledPixels> {
+        self.mirror.scaled_mask(|bounds| self.cover_bounds(bounds))
+    }
+
+    /// Inserts a primitive at its painted place, which differs from its logical one in a mirrored window.
+    #[inline]
+    fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        let mut primitive = primitive.into();
+        if self.mirror.enabled {
+            let logical = *primitive.bounds();
+            self.mirror.primitive(&mut primitive, self.mirror_mask());
+            match &primitive {
+                Primitive::Quad(quad) => self.record_mirror_quad(logical, *quad),
+                Primitive::Shadow(_) => {}
+                _ => self.record_mirror_surface(logical, *primitive.bounds()),
+            }
+        }
+        self.next_frame.scene.insert_primitive(primitive);
+    }
+
+    /// Mirrors the window for a right-to-left locale, as Qt's `LayoutMirroring` with inherited children.
+    pub fn set_layout_mirrored(&mut self, mirrored: bool) {
+        if self.mirror.enabled != mirrored {
+            self.mirror.enabled = mirrored;
+            self.refreshing = true;
+            self.refresh();
+        }
+    }
+
+    /// Whether the window paints mirrored, see [`Self::set_layout_mirrored`].
+    pub fn layout_mirrored(&self) -> bool {
+        self.mirror.enabled
+    }
+
+    /// Paints `f` left to right in `bounds`, moved whole to its mirrored place, with pointer input; the outermost call wins.
+    pub fn with_unmirrored<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let previous_scope = self.mirror.scope;
+        let mut entered = self.mirror.enter(bounds, true);
+        if let Some(unit) = entered.as_mut() {
+            let scope = self
+                .next_frame
+                .mirror_input
+                .push_scope(previous_scope, Some(unit.delta));
+            self.mirror.scope = Some(scope);
+            unit.scope = Some(scope);
+            self.mirror.unit_scope(scope);
+            self.next_frame
+                .mirror_units
+                .push(self.mirror.visible(*unit));
+            self.stamp_mirror_hits(
+                self.mirror.hitbox_start..self.mirror.hitbox_end,
+                Some(bounds),
+            );
+        }
+        let result = f(self);
+        self.mirror.exit(entered);
+        self.mirror.scope = previous_scope;
+        result
+    }
+
+    /// One visual line of text moves as a unit; `hit` records it so a click maps to its own glyph.
+    pub(crate) fn enter_text_unit(
+        &mut self,
+        line: Bounds<Pixels>,
+        hit: bool,
+    ) -> Option<MirrorUnit> {
+        let entered = self.mirror.enter(line, false);
+        if let Some(unit) = entered.filter(|_| hit) {
+            self.next_frame.mirror_units.push(self.mirror.visible(unit));
+        }
+        entered
+    }
+
+    pub(crate) fn exit_text_unit(&mut self, entered: Option<MirrorUnit>) {
+        self.mirror.exit(entered);
+    }
+
     /// Call to prevent the default action of an event. Currently only used to prevent
     /// parent elements from becoming focused on mouse down.
     pub fn prevent_default(&mut self) {
@@ -3620,7 +3774,20 @@ impl Window {
 
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
-        self.mouse_position
+        if !self.mirror.enabled {
+            return self.mouse_position;
+        }
+        if let Some(scope) = self.mirror.scope {
+            return self
+                .mirror_coordinates(self.mouse_position, Some(scope), false)
+                .0;
+        }
+        self.mirror_point_for_scope(
+            self.mouse_position,
+            self.mirror
+                .event_scope
+                .or_else(|| self.mirror_owner(self.mouse_position)),
+        )
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -3630,12 +3797,29 @@ impl Window {
     ///
     /// The capture is automatically released on mouse up.
     pub fn capture_pointer(&mut self, hitbox_id: HitboxId) {
+        self.captured_mirror = self.mirror.enabled.then(|| {
+            let frame = if self.mirror.scope.is_some() {
+                &self.next_frame
+            } else {
+                &self.rendered_frame
+            };
+            let owner = frame.mirror_input.hit_scope(&frame.hitboxes, hitbox_id);
+            let (position, unmirrored, reflected) =
+                self.mirror_mapping(self.mouse_position, owner, false, None);
+            MirrorCapture {
+                hitbox: hitbox_id,
+                reflected,
+                delta: self.mouse_position.x - position.x,
+                unmirrored,
+            }
+        });
         self.captured_hitbox = Some(hitbox_id);
     }
 
     /// Releases any active pointer capture.
     pub fn release_pointer(&mut self) {
         self.captured_hitbox = None;
+        self.captured_mirror = None;
     }
 
     /// Returns the hitbox that has captured the pointer, if any.
@@ -3708,6 +3892,8 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
+        self.mirror
+            .begin_frame(self.viewport_size, self.scale_factor);
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
@@ -4027,6 +4213,8 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
+        self.next_frame.mirror_input.enabled = self.mirror.enabled;
+        self.next_frame.mirror_input.width = self.viewport_size.width;
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
@@ -4050,6 +4238,8 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         #[cfg(feature = "profiler")]
         self.window_profiler
@@ -4245,6 +4435,17 @@ impl Window {
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
 
+            let prepaint = &deferred_draw.prepaint_range;
+            let previous_end = (
+                mem::replace(&mut self.mirror.hitbox_start, prepaint.start.hitboxes_index),
+                mem::replace(&mut self.mirror.hitbox_end, prepaint.end.hitboxes_index),
+            );
+            let parent_scope = self.mirror.enabled.then(|| {
+                self.next_frame
+                    .mirror_input
+                    .deferred_parent_scope(deferred_draw.parent_node)
+            });
+            let previous_scope = mem::replace(&mut self.mirror.scope, parent_scope);
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
@@ -4259,6 +4460,8 @@ impl Window {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
             let paint_end = self.paint_index();
+            self.mirror.scope = previous_scope;
+            (self.mirror.hitbox_start, self.mirror.hitbox_end) = previous_end;
             deferred_draw.paint_range = paint_start..paint_end;
         }
         self.next_frame.deferred_draws = deferred_draws;
@@ -4310,6 +4513,22 @@ impl Window {
             self.focus,
         );
 
+        for deferred in &self.rendered_frame.deferred_draws
+            [range.start.deferred_draws_index..range.end.deferred_draws_index]
+        {
+            if let Some(scope) = self
+                .rendered_frame
+                .mirror_input
+                .node_scopes
+                .get(&deferred.parent_node)
+            {
+                self.next_frame
+                    .mirror_input
+                    .deferred_parents
+                    .push((reused_subtree.refresh_node_id(deferred.parent_node), *scope));
+            }
+        }
+
         if reused_subtree.contains_focus() {
             self.next_frame.focus = self.focus;
         }
@@ -4342,6 +4561,12 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            mirror_units_index: self.next_frame.mirror_units.len(),
+            mirror_quads_index: self.next_frame.mirror_input.quads.len(),
+            mirror_hitbox_end: self.mirror.hitbox_end,
+            mirror_hitbox_start: self.mirror.hitbox_start,
+            mirror_scope: self.mirror.scope,
+            mirror_scopes_index: self.next_frame.mirror_input.scopes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -4363,6 +4588,7 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        self.reuse_mirror_input(&range);
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers
                 [range.start.input_handlers_index..range.end.input_handlers_index]
@@ -4457,10 +4683,12 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
+            self.mirror.push_mask(mask.bounds);
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
+            self.mirror.pop_mask();
             result
         } else {
             f(self)
@@ -4828,7 +5056,7 @@ impl Window {
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_layer(self.cover_bounds(self.mirror.bounds(clipped_bounds)));
         }
 
         let result = f(self);
@@ -4863,7 +5091,7 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
-            self.next_frame.scene.insert_primitive(Shadow {
+            self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -4908,7 +5136,7 @@ impl Window {
                 bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
-            self.next_frame.scene.insert_primitive(Shadow {
+            self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
@@ -4977,7 +5205,7 @@ impl Window {
         let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
-        let quad = Quad {
+        let mut quad = Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
@@ -4987,6 +5215,11 @@ impl Window {
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
         };
+        // Mirrored before the split, so the strips are cut from the painted quad.
+        if self.mirror.enabled {
+            self.mirror.quad(&mut quad, self.mirror_mask());
+            self.record_mirror_quad(snapped_bounds, quad);
+        }
 
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
@@ -5051,9 +5284,7 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        self.insert_primitive(path.scale(scale_factor));
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -5067,7 +5298,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
         let underline = self.underline(origin, width, style);
-        self.next_frame.scene.insert_primitive(underline);
+        self.insert_primitive(underline);
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
@@ -5089,7 +5320,7 @@ impl Window {
         };
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(Underline {
+        self.insert_primitive(Underline {
             order: 0,
             pad: 0,
             bounds,
@@ -5162,7 +5393,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
+                self.insert_primitive(SubpixelSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -5172,7 +5403,7 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
+                self.insert_primitive(MonochromeSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -5253,7 +5484,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
+            self.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
                 grayscale: false.into(),
@@ -5314,6 +5545,8 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let color = color.opacity(opacity);
+        let run_box = Bounds::new(origin, size(line.width, px(0.)));
+        let unit = self.enter_text_unit(run_box, false);
         for sprite in &resolved.sprites {
             let y = round_half_toward_zero((origin.y + sprite.glyph_y).0 * scale_factor);
             let bounds = Bounds {
@@ -5321,18 +5554,7 @@ impl Window {
                 size: sprite.size,
             };
             match sprite.kind {
-                ResolvedKind::Monochrome => {
-                    self.next_frame.scene.insert_primitive(MonochromeSprite {
-                        order: 0,
-                        pad: 0,
-                        bounds,
-                        content_mask,
-                        color,
-                        tile: sprite.tile,
-                        transformation: TransformationMatrix::unit(),
-                    })
-                }
-                ResolvedKind::Subpixel => self.next_frame.scene.insert_primitive(SubpixelSprite {
+                ResolvedKind::Monochrome => self.insert_primitive(MonochromeSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -5341,20 +5563,28 @@ impl Window {
                     tile: sprite.tile,
                     transformation: TransformationMatrix::unit(),
                 }),
-                ResolvedKind::Polychrome => {
-                    self.next_frame.scene.insert_primitive(PolychromeSprite {
-                        order: 0,
-                        pad: 0,
-                        grayscale: false.into(),
-                        bounds,
-                        corner_radii: Default::default(),
-                        content_mask,
-                        tile: sprite.tile,
-                        opacity,
-                    })
-                }
+                ResolvedKind::Subpixel => self.insert_primitive(SubpixelSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color,
+                    tile: sprite.tile,
+                    transformation: TransformationMatrix::unit(),
+                }),
+                ResolvedKind::Polychrome => self.insert_primitive(PolychromeSprite {
+                    order: 0,
+                    pad: 0,
+                    grayscale: false.into(),
+                    bounds,
+                    corner_radii: Default::default(),
+                    content_mask,
+                    tile: sprite.tile,
+                    opacity,
+                }),
             }
         }
+        self.exit_text_unit(unit);
         Ok(())
     }
 
@@ -5491,7 +5721,7 @@ impl Window {
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
             .map_size(|size| size.ceil());
 
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
+        self.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
             bounds: final_bounds,
@@ -5597,7 +5827,7 @@ impl Window {
             .scale(self.scale_factor());
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
+        self.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
@@ -5625,7 +5855,7 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
-        self.next_frame.scene.insert_primitive(PaintSurface {
+        self.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
@@ -5860,9 +6090,9 @@ impl Window {
 
         if focus_handle.is_focused(self) {
             let cx = self.to_async(cx);
-            self.next_frame
-                .input_handlers
-                .push(Some(PlatformInputHandler::new(cx, Box::new(input_handler))));
+            let mut handler = PlatformInputHandler::new(cx, Box::new(input_handler));
+            handler.mirror_scope = self.mirror.scope;
+            self.next_frame.input_handlers.push(Some(handler));
         }
     }
 
@@ -5897,8 +6127,17 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
+        self.next_frame
+            .mirror_input
+            .listeners
+            .push(self.mirror.scope);
         self.next_frame.mouse_listeners.push(Some(Box::new(
             move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                let mapped = window.mirror_event(event);
+                let event = mapped
+                    .as_ref()
+                    .and_then(PlatformInput::mouse_event)
+                    .unwrap_or(event);
                 if let Some(event) = event.downcast_ref() {
                     listener(event, phase, window, cx)
                 }
@@ -6050,6 +6289,16 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Maps logical bounds the platform positions against (an IME caret) to painted ones.
+    pub(crate) fn mirror_bounds_out(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        self.mirror_bounds_out_for_scope(bounds, None)
+    }
+
+    /// Maps a painted point for the receiver under it, or the captured receiver.
+    pub(crate) fn mirror_point_in(&self, position: Point<Pixels>) -> Point<Pixels> {
+        self.mirror_point_for_scope(position, self.mirror_owner(position))
+    }
+
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -6125,7 +6374,7 @@ impl Window {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
-                            cursor_offset: position,
+                            cursor_offset: self.mirror_point_in(position),
                             cursor_style: None,
                             external_payload_source: None,
                         });
@@ -6427,7 +6676,7 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.rendered_frame.hit_test(self.mouse_position);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -6444,7 +6693,14 @@ impl Window {
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
         // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
+        for (index, listener) in mouse_listeners.iter_mut().enumerate() {
+            self.mirror.event_scope = self
+                .rendered_frame
+                .mirror_input
+                .listeners
+                .get(index)
+                .copied()
+                .flatten();
             let listener = listener.as_mut().unwrap();
             listener(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
@@ -6454,7 +6710,14 @@ impl Window {
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
+            for (index, listener) in mouse_listeners.iter_mut().enumerate().rev() {
+                self.mirror.event_scope = self
+                    .rendered_frame
+                    .mirror_input
+                    .listeners
+                    .get(index)
+                    .copied()
+                    .flatten();
                 let listener = listener.as_mut().unwrap();
                 listener(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
@@ -6463,6 +6726,7 @@ impl Window {
             }
         }
 
+        self.mirror.event_scope = None;
         self.rendered_frame.mouse_listeners = mouse_listeners;
 
         if cx.has_active_drag() {
@@ -6481,6 +6745,7 @@ impl Window {
         // Auto-release pointer capture on mouse up
         if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
             self.captured_hitbox = None;
+            self.captured_mirror = None;
         }
     }
 
@@ -7556,7 +7821,8 @@ impl Window {
         match request.action {
             accesskit::Action::Click => {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
-                    let center = bounds.center();
+                    // Dispatch takes painted positions, so a mirrored window maps the logical node first.
+                    let center = self.mirror_bounds_out(bounds).center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
                         position: center,

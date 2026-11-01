@@ -569,6 +569,12 @@ fn paint_line(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        // Each visual line moves as one unit in a mirrored window, with its decorations.
+        let line = |origin, width| Bounds::new(origin, size(width, line_height));
+        let mut unit = window.enter_text_unit(
+            line(glyph_origin, line_width(layout, px(0.), wraps.peek())),
+            true,
+        );
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -628,6 +634,14 @@ fn paint_line(
                         wraps.peek(),
                     );
                     glyph_origin.y += line_height;
+                    window.exit_text_unit(unit);
+                    unit = window.enter_text_unit(
+                        line(
+                            glyph_origin,
+                            line_width(layout, glyph.position.x, wraps.peek()),
+                        ),
+                        true,
+                    );
                 }
                 prev_glyph_position = glyph.position;
 
@@ -731,13 +745,13 @@ fn paint_line(
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
-                    if glyph.is_emoji {
+                    let painted = if glyph.is_emoji {
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
-                        )?;
+                        )
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
@@ -745,7 +759,11 @@ fn paint_line(
                             glyph.id,
                             layout.font_size,
                             color,
-                        )?;
+                        )
+                    };
+                    if painted.is_err() {
+                        window.exit_text_unit(unit);
+                        return painted;
                     }
                 }
             }
@@ -783,6 +801,7 @@ fn paint_line(
                 &strikethrough_style,
             );
         }
+        window.exit_text_unit(unit);
 
         Ok(())
     })
@@ -826,6 +845,11 @@ fn paint_line_background(
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
+        let line = |origin, width| Bounds::new(origin, size(width, line_height));
+        let mut unit = window.enter_text_unit(
+            line(glyph_origin, line_width(layout, px(0.), wraps.peek())),
+            false,
+        );
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -863,6 +887,14 @@ fn paint_line_background(
                         wraps.peek(),
                     );
                     glyph_origin.y += line_height;
+                    window.exit_text_unit(unit);
+                    unit = window.enter_text_unit(
+                        line(
+                            glyph_origin,
+                            line_width(layout, glyph.position.x, wraps.peek()),
+                        ),
+                        false,
+                    );
                 }
                 prev_glyph_position = glyph.position;
 
@@ -933,6 +965,7 @@ fn paint_line_background(
                 background_color,
             ));
         }
+        window.exit_text_unit(unit);
 
         Ok(())
     })
@@ -983,6 +1016,20 @@ fn line_paint_bounds(
     bounds
 }
 
+/// The width of the visual line that starts at `last_glyph_x` and ends at the next wrap or the layout's end.
+fn line_width(
+    layout: &LineLayout,
+    last_glyph_x: Pixels,
+    wrap_boundary: Option<&&WrapBoundary>,
+) -> Pixels {
+    let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
+        layout.runs[*run_ix].glyphs[*glyph_ix].position.x
+    } else {
+        layout.width
+    };
+    end_of_line - last_glyph_x
+}
+
 fn aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
@@ -991,13 +1038,7 @@ fn aligned_origin_x(
     layout: &LineLayout,
     wrap_boundary: Option<&&WrapBoundary>,
 ) -> Pixels {
-    let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
-        layout.runs[*run_ix].glyphs[*glyph_ix].position.x
-    } else {
-        layout.width
-    };
-
-    let line_width = end_of_line - last_glyph_x;
+    let line_width = line_width(layout, last_glyph_x, wrap_boundary);
 
     match align {
         TextAlign::Left => origin.x,

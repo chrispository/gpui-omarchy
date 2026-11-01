@@ -338,6 +338,8 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     },
     Prepaint {
         node_id: DispatchNodeId,
+        mirror_hitbox_start: usize,
+        mirror_hitbox_end: usize,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         bounds: Bounds<Pixels>,
@@ -463,6 +465,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
+                let mirror_hitbox_start = window.next_frame.hitboxes.len();
                 let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -505,6 +508,8 @@ impl<E: Element> Drawable<E> {
 
                 self.phase = ElementDrawPhase::Prepaint {
                     node_id,
+                    mirror_hitbox_start,
+                    mirror_hitbox_end: window.next_frame.hitboxes.len(),
                     global_id,
                     inspector_id,
                     bounds,
@@ -524,6 +529,8 @@ impl<E: Element> Drawable<E> {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Prepaint {
                 node_id,
+                mirror_hitbox_start,
+                mirror_hitbox_end,
                 global_id,
                 inspector_id,
                 bounds,
@@ -537,15 +544,17 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
-                self.element.paint(
-                    global_id.as_ref(),
-                    inspector_id.as_ref(),
-                    bounds,
-                    &mut request_layout,
-                    &mut prepaint,
-                    window,
-                    cx,
-                );
+                window.with_mirror_hitbox_range(mirror_hitbox_start..mirror_hitbox_end, |window| {
+                    self.element.paint(
+                        global_id.as_ref(),
+                        inspector_id.as_ref(),
+                        bounds,
+                        &mut request_layout,
+                        &mut prepaint,
+                        window,
+                        cx,
+                    );
+                });
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
