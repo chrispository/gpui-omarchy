@@ -1906,6 +1906,10 @@ impl LinuxKeyboardMapper {
 
     /// The state of this group with `modifiers` held.
     fn state(&self, modifiers: gpui::Modifiers) -> State {
+        self.state_with_capslock(modifiers, gpui::Capslock::default())
+    }
+
+    fn state_with_capslock(&self, modifiers: gpui::Modifiers, capslock: gpui::Capslock) -> State {
         let mut mask = 0;
         for (held, name) in [
             (modifiers.shift, xkb::MOD_NAME_SHIFT),
@@ -1919,7 +1923,13 @@ impl LinuxKeyboardMapper {
             }
         }
         let mut state = State::new(&self.keymap);
-        state.update_mask(mask, 0, 0, 0, 0, self.group);
+        let caps_index = self.keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let locked = if capslock.on && caps_index != xkb::MOD_INVALID {
+            1 << caps_index
+        } else {
+            0
+        };
+        state.update_mask(mask, 0, locked, 0, 0, self.group);
         state
     }
 
@@ -1964,6 +1974,30 @@ impl LinuxKeyboardMapper {
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 impl PlatformKeyboardMapper for LinuxKeyboardMapper {
+    fn shortcut_samples(
+        &self,
+        modifiers: gpui::Modifiers,
+        capslock: gpui::Capslock,
+    ) -> Option<Vec<(gpui::Keystroke, gpui::Modifiers)>> {
+        if modifiers.function {
+            return None;
+        }
+        let state = self.state_with_capslock(modifiers, capslock);
+        let held = modifiers_from_xkb(&state);
+        let mut samples = Vec::new();
+        for raw in self.keymap.min_keycode().raw()..=self.keymap.max_keycode().raw() {
+            let code = Keycode::new(raw);
+            if state.key_get_layout(code) == xkb::LAYOUT_INVALID {
+                continue;
+            }
+            let event = keystroke_from_xkb(&state, held, code);
+            if !event.is_keypad {
+                samples.push((event, held));
+            }
+        }
+        Some(samples)
+    }
+
     fn map_key_equivalent(
         &self,
         keystroke: gpui::Keystroke,
@@ -2669,6 +2703,250 @@ mod i50_xkb_tests {
     impl IdentityOf for XkbKeyboardLayout {
         fn identity_of(&self) -> KeyboardLayoutIdentity {
             KeyboardLayoutIdentity::parse(self.id()).expect("a Linux layout id is an identity")
+        }
+    }
+
+    fn raw_samples(
+        layout: &XkbKeyboardLayout,
+        held: Modifiers,
+        caps: bool,
+    ) -> Vec<(Keystroke, Modifiers)> {
+        layout
+            .mapper()
+            .shortcut_samples(held, gpui::Capslock { on: caps })
+            .expect("native samples supported")
+    }
+
+    #[test]
+    fn shortcut_samples_us_uk_and_nonlatin_raw_events() {
+        let us = pc105("us", "");
+        let base = raw_samples(&layout_at(&us, 0), Modifiers::none(), false);
+        let shifted = raw_samples(&layout_at(&us, 0), Modifiers::shift(), false);
+        let zero = press(&us, 0, &[], "AE10");
+        let paren = press(&us, 0, &[SHIFT], "AE10");
+        assert_ne!(zero, paren);
+        assert!(base.contains(&(zero.clone(), Modifiers::none())));
+        assert!(!base.iter().any(|(event, _)| event == &paren));
+        assert!(shifted.contains(&(paren.clone(), Modifiers::shift())));
+        assert!(!shifted.iter().any(|(event, _)| event == &zero));
+        assert!(!paren.modifiers.shift);
+        assert_eq!(paren.key_char.as_deref(), Some(")"));
+        let gb = pc105("gb", "");
+        let pound = press(&gb, 0, &[SHIFT], "AE03");
+        assert_eq!(
+            (
+                pound.key.as_str(),
+                pound.key_char.as_deref(),
+                pound.us_key.as_deref()
+            ),
+            ("sterling", Some("£"), Some("#"))
+        );
+        assert!(
+            raw_samples(&layout_at(&gb, 0), Modifiers::shift(), false)
+                .contains(&(pound, Modifiers::shift()))
+        );
+        let ru = pc105("ru", "");
+        let letter = press(&ru, 0, &[], "AD01");
+        assert_eq!(
+            (
+                letter.key.as_str(),
+                letter.key_char.as_deref(),
+                letter.us_key.as_deref()
+            ),
+            ("q", Some("й"), Some("q"))
+        );
+        assert!(
+            raw_samples(&layout_at(&ru, 0), Modifiers::none(), false)
+                .contains(&(letter, Modifiers::none()))
+        );
+    }
+
+    #[test]
+    fn shortcut_samples_match_native_modifiers_caps_variants_and_options() {
+        for (name, variant, options) in [
+            ("us", "", ""),
+            ("gb,ru", "", "grp:shifts_toggle"),
+            ("us", "dvorak", "ctrl:swapcaps"),
+            ("de", "", "caps:shiftlock"),
+        ] {
+            let keymap = keymap("pc105", name, variant, options);
+            for group in 0..keymap.num_layouts() {
+                let layout = layout_at(&keymap, group);
+                for bits in 0..16 {
+                    let held = Modifiers {
+                        shift: bits & 1 != 0,
+                        control: bits & 2 != 0,
+                        alt: bits & 4 != 0,
+                        platform: bits & 8 != 0,
+                        function: false,
+                    };
+                    let names: Vec<_> = [
+                        (held.shift, SHIFT),
+                        (held.control, CTRL),
+                        (held.alt, ALT),
+                        (held.platform, SUPER),
+                    ]
+                    .into_iter()
+                    .filter_map(|(on, name)| on.then_some(name))
+                    .collect();
+                    for caps in [false, true] {
+                        let mut native = state(&keymap, group, &names);
+                        let cap_index = keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+                        assert_ne!(cap_index, xkb::MOD_INVALID);
+                        native.update_mask(
+                            native.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+                            0,
+                            if caps { 1 << cap_index } else { 0 },
+                            0,
+                            0,
+                            group,
+                        );
+                        let effective = modifiers_from_xkb(&native);
+                        let samples = raw_samples(&layout, held, caps);
+                        for &(raw, _, _) in &US_POSITIONS {
+                            let event = keystroke_from_xkb(&native, effective, Keycode::new(raw));
+                            assert!(
+                                samples.contains(&(event, effective)),
+                                "{name}({variant}) {options} group {group} bits {bits} caps {caps} code {raw}"
+                            );
+                        }
+                        assert!(samples.iter().all(|(event, _)| !event.is_keypad));
+                    }
+                }
+            }
+        }
+        let us = pc105("us", "");
+        let layout = layout_at(&us, 0);
+        let upper = press(&us, 0, &[xkb::MOD_NAME_CAPS], "AD01");
+        assert_eq!(upper.key_char.as_deref(), Some("Q"));
+        assert!(
+            raw_samples(&layout, Modifiers::none(), true)
+                .contains(&(upper.clone(), Modifiers::none()))
+        );
+        assert!(upper.should_match(&mapped(&us, 0, "q", false)));
+        assert!(
+            press(&us, 0, &[SHIFT, xkb::MOD_NAME_CAPS], "AD01")
+                .should_match(&mapped(&us, 0, "shift-q", false))
+        );
+    }
+
+    #[test]
+    fn shortcut_samples_follow_group_generation_and_custom_compiled_map() {
+        let original = pc105("us,ru", "");
+        let first = layout_at(&original, 0);
+        assert!(first.follow(Some(&state(&original, 0, &[SHIFT]))).is_none());
+        let next = first.follow(Some(&state(&original, 1, &[]))).unwrap();
+        assert!(next.identity_of().generation > first.identity_of().generation);
+        assert_ne!(
+            raw_samples(&first, Modifiers::none(), false),
+            raw_samples(&next, Modifiers::none(), false)
+        );
+        let source = original.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let changed = source.replacen(
+            "[               q,               Q ]",
+            "[               x,               X ]",
+            1,
+        );
+        assert_ne!(source, changed, "the compiled AD01 symbols must change");
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let custom = xkb::Keymap::new_from_string(
+            &context,
+            changed,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        assert_eq!(original.layout_get_name(0), custom.layout_get_name(0));
+        let fresh = first.follow(Some(&state(&custom, 0, &[]))).unwrap();
+        assert!(fresh.identity_of().generation > first.identity_of().generation);
+        let custom_event = press(&custom, 0, &[], "AD01");
+        assert_eq!(custom_event.key_char.as_deref(), Some("x"));
+        assert!(
+            raw_samples(&fresh, Modifiers::none(), false)
+                .contains(&(custom_event, Modifiers::none()))
+        );
+        let lost = fresh.follow(None).unwrap();
+        assert!(
+            lost.mapper()
+                .shortcut_samples(Modifiers::none(), gpui::Capslock::default())
+                .is_none()
+        );
+        assert!(
+            gpui::DummyKeyboardMapper
+                .shortcut_samples(Modifiers::none(), gpui::Capslock::default())
+                .is_none()
+        );
+        assert!(
+            first
+                .mapper()
+                .shortcut_samples(
+                    Modifiers {
+                        function: true,
+                        ..Default::default()
+                    },
+                    gpui::Capslock::default()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shortcut_samples_include_iso_main_block_and_preserve_keycaps() {
+        let keymap = pc105("gb", "");
+        let layout = layout_at(&keymap, 0);
+        for mods in [&[][..], &[SHIFT]] {
+            let extra = press(&keymap, 0, mods, "LSGT");
+            assert!(
+                raw_samples(&layout, modifiers(mods), false).contains(&(extra, modifiers(mods)))
+            );
+            let space = press(&keymap, 0, mods, "SPCE");
+            assert!(
+                raw_samples(&layout, modifiers(mods), false).contains(&(space, modifiers(mods)))
+            );
+        }
+        let mapper = layout.mapper();
+        let before = mapper.map_key_equivalent(binding("#"), true);
+        raw_samples(&layout, Modifiers::shift(), true);
+        assert_eq!(before, mapper.map_key_equivalent(binding("#"), true));
+        assert!(before.inner().key_char.is_none());
+    }
+
+    #[test]
+    fn shortcut_samples_are_raw_before_native_composition() {
+        let keymap = pc105("de", "");
+        let layout = layout_at(&keymap, 0);
+        let native = state(&keymap, 0, &[]);
+        let dead_code = code(&keymap, "AE12");
+        let dead = native.key_get_one_sym(dead_code);
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let mut compose = get_xkb_compose_state(&context).expect("native locale compose table");
+        compose.feed(dead);
+        assert_eq!(compose.status(), xkb::Status::Composing);
+        let raw = keystroke_from_xkb(&native, modifiers_from_xkb(&native), dead_code);
+        assert!(raw.key_char.is_none());
+        assert!(raw_samples(&layout, Modifiers::none(), false).contains(&(raw, Modifiers::none())));
+        assert!(composes(Modifiers::none()));
+        assert!(!composes(Modifiers::control()));
+        let command = press(&keymap, 0, &[CTRL], "AE12");
+        assert!(
+            raw_samples(&layout, Modifiers::control(), false)
+                .contains(&(command, Modifiers::control()))
+        );
+    }
+
+    #[test]
+    fn shortcut_samples_compiled_keymap_receipts() {
+        for (name, variant, options) in [
+            ("us", "", ""),
+            ("gb,ru", "", "grp:shifts_toggle"),
+            ("us", "dvorak", "ctrl:swapcaps"),
+            ("de", "", "caps:shiftlock"),
+        ] {
+            let keymap = keymap("pc105", name, variant, options);
+            eprintln!(
+                "COMPILED_XKB_BEGIN {name} {variant} {options}\n{}\nCOMPILED_XKB_END",
+                keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            );
         }
     }
 
