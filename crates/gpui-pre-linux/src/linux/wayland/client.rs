@@ -151,6 +151,30 @@ impl TextInputRequests for zwp_text_input_v3::ZwpTextInputV3 {
     }
 }
 
+impl super::drag_events::DropHost for WaylandClientStatePtr {
+    type Offer = DataOffer<WlDataOffer>;
+    type Window = WaylandWindowStatePtr;
+
+    fn with_drag<R>(
+        &self,
+        f: impl FnOnce(&mut DragState, Modifiers, &Rc<RefCell<LinuxCommon>>) -> R,
+    ) -> Option<R> {
+        let client = self.0.upgrade()?;
+        let mut state = client.borrow_mut();
+        let common = state.common.clone();
+        let modifiers = state.modifiers;
+        Some(f(&mut state.drag, modifiers, &common))
+    }
+
+    fn handle(window: &Self::Window) -> AnyWindowHandle {
+        window.handle()
+    }
+
+    fn input(window: &Self::Window, event: FileDropEvent) {
+        window.handle_input(PlatformInput::FileDrop(event));
+    }
+}
+
 impl ImeHost for WaylandClientStatePtr {
     type Surface = ObjectId;
     type TextInput = zwp_text_input_v3::ZwpTextInputV3;
@@ -3244,15 +3268,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     .detach();
             }
             wl_data_device::Event::Motion { x, y, .. } => {
-                state.drag.position = Point::new(x.into(), y.into());
-                let window = state.drag.window.clone();
-                let entered = state.drag.entered;
-                let position = state.drag.position;
                 drop(state);
-                if entered && let Some(window) = window {
-                    window
-                        .handle_input(PlatformInput::FileDrop(FileDropEvent::Pending { position }));
-                }
+                super::drag_events::motion(this, Point::new(x.into(), y.into()));
             }
             wl_data_device::Event::Leave => {
                 let window = state.drag.window.clone();
@@ -3315,20 +3332,12 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_data_offer::Event::Action { dnd_action } => {
-                if state
-                    .drag
-                    .offer
-                    .as_ref()
-                    .is_some_and(|offer| offer.inner.id() == data_offer.id())
-                {
-                    state.drag.action = match dnd_action {
-                        WEnum::Value(DndAction::Copy) => Some(gpui::NativeDragAction::Copy),
-                        WEnum::Value(DndAction::Move) => Some(gpui::NativeDragAction::Move),
-                        _ => None,
-                    };
-                    drop(state);
-                    this.dispatch_native_drop();
-                }
+                drop(state);
+                super::drag_events::action(
+                    this,
+                    |offer| offer.inner.id() == data_offer.id(),
+                    dnd_action,
+                );
             }
             _ => (),
         }
@@ -3825,75 +3834,7 @@ impl WaylandClientStatePtr {
     }
 
     fn dispatch_native_drop(&self) {
-        let Some(client) = self.0.upgrade() else {
-            return;
-        };
-        let state = client.borrow();
-        let (Some(offer), Some(window), Some(data)) = (
-            state.drag.offer.clone(),
-            state.drag.window.clone(),
-            state.drag.data.clone(),
-        ) else {
-            return;
-        };
-        let generation = state.drag.generation;
-        let position = state.drag.position;
-        let offered_types = state.drag.offered_types.clone();
-        let action = state.drag.action;
-        let entered = state.drag.entered;
-        let dropped = state.drag.dropped;
-        let modifiers = state.modifiers;
-        let common = state.common.clone();
-        let paths = state.drag.paths.clone();
-        drop(state);
-        let has_paths = !paths.0.is_empty();
-        if !entered {
-            let event = gpui::NativeDropEvent {
-                window: window.handle(),
-                position,
-                dropped: false,
-                offered_types: offered_types.clone(),
-                data: data.clone(),
-                action,
-                modifiers,
-            };
-            let allowed = crate::linux::transfer::allow_drop(&common, event, has_paths);
-            if !client.borrow_mut().drag.admit(generation, allowed) {
-                return;
-            }
-            if has_paths {
-                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Entered {
-                    position,
-                    paths,
-                }));
-            }
-        }
-        if !dropped {
-            return;
-        }
-        let accepted = (offer.inner.version() < 3 || action.is_some()) && {
-            let event = gpui::NativeDropEvent {
-                window: window.handle(),
-                position,
-                dropped: true,
-                offered_types,
-                data,
-                action,
-                modifiers,
-            };
-            crate::linux::transfer::allow_drop(&common, event, has_paths)
-        };
-        if client.borrow().drag.generation != generation {
-            return;
-        }
-        if has_paths {
-            window.handle_input(PlatformInput::FileDrop(if accepted {
-                FileDropEvent::Submit { position }
-            } else {
-                FileDropEvent::Exited
-            }));
-        }
-        client.borrow_mut().drag.submit(generation, accepted);
+        super::drag_events::dispatch(self);
     }
 }
 

@@ -3,6 +3,7 @@ mod clipboard;
 mod cursor;
 mod display;
 mod drag;
+mod drag_events;
 mod ime;
 mod ime_context;
 mod ime_events;
