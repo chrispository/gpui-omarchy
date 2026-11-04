@@ -304,6 +304,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        let _trace = crate::startup_trace::span("gpu.renderer_new");
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
@@ -510,9 +511,14 @@ impl WgpuRenderer {
         };
         // Configure the surface immediately. The adapter selection process already validated
         // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
+        {
+            let _trace = crate::startup_trace::span("gpu.surface_window_configure");
+            surface.configure(&context.device, &surface_config);
+        }
 
+        let core_trace = crate::startup_trace::span("gpu.renderer_core");
         let core = WgpuRendererCore::new(context, atlas.clone(), surface_format, alpha_mode);
+        drop(core_trace);
 
         Ok(Self {
             context: gpu_context,
@@ -718,6 +724,7 @@ impl WgpuRendererCore {
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
     ) -> WgpuPipelines {
+        let _trace = crate::startup_trace::span("gpu.pipelines_all");
         // Diagnostic guard: verify the device actually has
         // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
         // feature mismatch caused a wgpu-hal abort, but we haven't
@@ -746,11 +753,14 @@ impl WgpuRendererCore {
         } else {
             STORAGE_BUFFER_SHADERS
         };
+        let shader_trace = crate::startup_trace::span("gpu.shader_main");
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
+        drop(shader_trace);
+        let subpixel_trace = crate::startup_trace::span("gpu.shader_subpixel");
         let subpixel_shader_module = if dual_source_blending {
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("gpui_subpixel_shaders"),
@@ -760,6 +770,7 @@ impl WgpuRendererCore {
             None
         };
 
+        drop(subpixel_trace);
         let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
                 wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
@@ -773,7 +784,7 @@ impl WgpuRendererCore {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let create_pipeline = |name: &str,
+        let create_pipeline = |name: &'static str,
                                vs_entry: &str,
                                fs_entry: &str,
                                globals_layout: &wgpu::BindGroupLayout,
@@ -783,6 +794,7 @@ impl WgpuRendererCore {
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32,
                                module: &wgpu::ShaderModule| {
+            let _trace = crate::startup_trace::span(name);
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             bind_group_layouts.extend(texture_layout.map(Some));
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1121,6 +1133,7 @@ impl WgpuRenderer {
         if new_alpha_mode == self.surface_config.alpha_mode {
             return;
         }
+        let _trace = crate::startup_trace::span(if transparent { "gpu.alpha_to_transparent" } else { "gpu.alpha_to_opaque" });
         self.surface_config.alpha_mode = new_alpha_mode;
         let format = self.surface_config.format;
 

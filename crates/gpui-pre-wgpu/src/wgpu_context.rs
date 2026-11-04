@@ -418,6 +418,7 @@ impl WgpuContext {
     async fn create_device(
         adapter: &wgpu::Adapter,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+        let _trace = crate::startup_trace::span("gpu.create_device");
         let dual_source_blending = adapter
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
@@ -479,6 +480,7 @@ impl WgpuContext {
         display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
         backends: wgpu::Backends,
     ) -> wgpu::Instance {
+        let _trace = crate::startup_trace::span("gpu.instance");
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             flags: wgpu::InstanceFlags::default(),
@@ -522,7 +524,10 @@ impl WgpuContext {
         bool,
         TextureFormat,
     )> {
-        let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let mut adapters: Vec<_> = {
+            let _trace = crate::startup_trace::span("gpu.enumerate_adapters");
+            instance.enumerate_adapters(wgpu::Backends::all()).await
+        };
 
         if adapters.is_empty() {
             anyhow::bail!("No GPU adapters found");
@@ -675,7 +680,10 @@ impl WgpuContext {
             view_formats: vec![],
         };
 
-        surface.configure(&device, &test_config);
+        {
+            let _trace = crate::startup_trace::span("gpu.surface_test_configure");
+            surface.configure(&device, &test_config);
+        }
 
         let error = error_scope.pop().await;
         if let Some(e) = error {

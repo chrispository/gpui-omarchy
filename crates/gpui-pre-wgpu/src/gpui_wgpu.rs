@@ -5,6 +5,7 @@ mod gpu_fence;
 mod fontconfig_on_demand;
 mod wgpu_atlas;
 mod wgpu_context;
+pub mod startup_trace;
 mod wgpu_renderer;
 
 pub use cosmic_text_system::*;

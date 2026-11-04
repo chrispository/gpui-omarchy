@@ -1371,10 +1371,12 @@ impl WaylandConnection {
         // Receive the outputs' descriptions now, so displays are known before
         // the app's first windows open.
         let mut pointer = pointer;
+        let roundtrip_trace = gpui_wgpu::startup_trace::span("wayland.initial_roundtrip");
         event_queue
             .roundtrip(&mut pointer)
             .context("failed to receive initial Wayland state")
             .log_err();
+        drop(roundtrip_trace);
 
         client.register_source(
             handle.insert_source(WaylandSource::new(conn, event_queue), {

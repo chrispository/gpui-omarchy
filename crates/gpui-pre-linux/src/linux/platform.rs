@@ -126,6 +126,7 @@ impl LinuxCommon {
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         // Omarchy: fonts are read through fontconfig when first used, not all parsed at startup.
+        let text_trace = gpui_wgpu::startup_trace::span("platform.text_system");
         let text_system = Arc::new(crate::linux::CosmicTextSystem::new_on_demand(
             "IBM Plex Sans",
         ));
@@ -134,6 +135,7 @@ impl LinuxCommon {
 
         let callbacks = PlatformHandlers::default();
 
+        drop(text_trace);
         let dispatcher = Arc::new(LinuxDispatcher::new(main_sender));
 
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
@@ -317,6 +319,7 @@ struct StartupEnvironment {
 impl LinuxPlatform {
     /// Creates the platform, headless until `run` connects it in its initial mode.
     pub(crate) fn new(allowed_modes: WindowingModes) -> Self {
+        let _trace = gpui_wgpu::startup_trace::span("platform.new");
         let startup = StartupEnvironment {
             #[cfg(feature = "wayland")]
             activation_token: crate::linux::take_startup_activation_token_from_environment(),
