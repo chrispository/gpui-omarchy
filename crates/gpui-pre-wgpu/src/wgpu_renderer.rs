@@ -130,7 +130,11 @@ struct WgpuPipelines {
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    /// Built on the first frame that draws subpixel text, so renderers that only ever draw
+    /// grayscale text never compile the dual-source shader.
     subpixel_sprites: Option<wgpu::RenderPipeline>,
+    /// Whether the device can build `subpixel_sprites`.
+    subpixel_supported: bool,
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
@@ -709,6 +713,116 @@ impl WgpuRendererCore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_render_pipeline(
+        device: &wgpu::Device,
+        name: &str,
+        vs_entry: &str,
+        fs_entry: &str,
+        globals_layout: &wgpu::BindGroupLayout,
+        data_layout: &wgpu::BindGroupLayout,
+        texture_layout: Option<&wgpu::BindGroupLayout>,
+        topology: wgpu::PrimitiveTopology,
+        color_targets: &[Option<wgpu::ColorTargetState>],
+        sample_count: u32,
+        module: &wgpu::ShaderModule,
+    ) -> wgpu::RenderPipeline {
+        let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
+        bind_group_layouts.extend(texture_layout.map(Some));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{name}_layout")),
+            bind_group_layouts: &bind_group_layouts,
+            immediate_size: 0,
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(name),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some(vs_entry),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some(fs_entry),
+                targets: color_targets,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    fn create_subpixel_pipeline(
+        device: &wgpu::Device,
+        layouts: &WgpuBindGroupLayouts,
+        surface_format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpui_subpixel_shaders"),
+            source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
+        });
+        let subpixel_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Src1,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        Self::create_render_pipeline(
+            device,
+            "subpixel_sprites",
+            "vs_subpixel_sprite",
+            "fs_subpixel_sprite",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(subpixel_blend),
+                write_mask: wgpu::ColorWrites::COLOR,
+            })],
+            1,
+            &module,
+        )
+    }
+
+    /// Builds the subpixel pipeline before the first frame that needs it.
+    fn ensure_subpixel_pipeline(&mut self) {
+        let resources = &mut self.resources;
+        if resources.pipelines.subpixel_sprites.is_none() && resources.pipelines.subpixel_supported
+        {
+            resources.pipelines.subpixel_sprites = Some(Self::create_subpixel_pipeline(
+                &resources.device,
+                &resources.bind_group_layouts,
+                self.target_format,
+            ));
+        }
+    }
+
     fn create_pipelines(
         device: &wgpu::Device,
         layouts: &WgpuBindGroupLayouts,
@@ -751,15 +865,6 @@ impl WgpuRendererCore {
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        let subpixel_shader_module = if dual_source_blending {
-            Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
-            }))
-        } else {
-            None
-        };
-
         let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
                 wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
@@ -783,47 +888,19 @@ impl WgpuRendererCore {
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32,
                                module: &wgpu::ShaderModule| {
-            let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &bind_group_layouts,
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
+            Self::create_render_pipeline(
+                device,
+                name,
+                vs_entry,
+                fs_entry,
+                globals_layout,
+                data_layout,
+                texture_layout,
+                topology,
+                color_targets,
+                sample_count,
+                module,
+            )
         };
 
         let quads = create_pipeline(
@@ -925,40 +1002,6 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
-            let subpixel_blend = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Src1,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-
-            Some(create_pipeline(
-                "subpixel_sprites",
-                "vs_subpixel_sprite",
-                "fs_subpixel_sprite",
-                &layouts.globals,
-                &layouts.instances,
-                Some(&layouts.texture),
-                wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(subpixel_blend),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-                1,
-                subpixel_module,
-            ))
-        } else {
-            None
-        };
-
         let poly_sprites = create_pipeline(
             "poly_sprites",
             "vs_poly_sprite",
@@ -992,7 +1035,8 @@ impl WgpuRendererCore {
             paths,
             underlines,
             mono_sprites,
-            subpixel_sprites,
+            subpixel_sprites: None,
+            subpixel_supported: dual_source_blending,
             poly_sprites,
             surfaces,
         }
@@ -1555,6 +1599,9 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        if !scene.subpixel_sprites.is_empty() {
+            self.ensure_subpixel_pipeline();
+        }
 
         let mut encoder =
             self.resources()
