@@ -309,6 +309,11 @@ impl WgpuRenderer {
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
         let raw_window_handle = window_handle.as_raw();
+        // Named on every surface: a prewarmed instance was created without a display.
+        let raw_display_handle = window
+            .display_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+            .as_raw();
 
         // Use the existing context's instance if available, otherwise create a new one.
         // The surface must be created with the same instance that will be used for
@@ -321,7 +326,7 @@ impl WgpuRenderer {
         let mut ctx_ref = gpu_context.borrow_mut();
         let surface = match existing_instance {
             Some(instance) => {
-                let surface = Self::create_raw_surface(&instance, raw_window_handle)?;
+                let surface = create_surface(&instance, raw_display_handle, raw_window_handle)?;
                 ctx_ref
                     .as_ref()
                     .context("GPU context vanished while its instance was in use")?
@@ -330,7 +335,12 @@ impl WgpuRenderer {
             }
             None => {
                 let (context, surface) =
-                    Self::new_context_vulkan_first(window, raw_window_handle, compositor_gpu)?;
+                    Self::new_context_vulkan_first(
+                        window,
+                        raw_display_handle,
+                        raw_window_handle,
+                        compositor_gpu,
+                    )?;
                 *ctx_ref = Some(context);
                 surface
             }
@@ -351,27 +361,11 @@ impl WgpuRenderer {
         )
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    fn create_raw_surface(
-        instance: &wgpu::Instance,
-        raw_window_handle: raw_window_handle::RawWindowHandle,
-    ) -> anyhow::Result<wgpu::Surface<'static>> {
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle,
-        };
-        // Safety: The caller guarantees that the window handle is valid for the
-        // lifetime of this renderer. In practice, the RawWindow struct is created
-        // from the native window handles and the surface is dropped before the window.
-        unsafe { instance.create_surface_unsafe(target) }
-            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
-    }
-
     /// Tries Vulkan alone before GL: an instance listing both brings up EGL on every launch even when Vulkan wins.
     #[cfg(not(target_family = "wasm"))]
     fn new_context_vulkan_first<W>(
         window: &W,
+        raw_display_handle: raw_window_handle::RawDisplayHandle,
         raw_window_handle: raw_window_handle::RawWindowHandle,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)>
@@ -380,10 +374,16 @@ impl WgpuRenderer {
     {
         let mut last_error = None;
         for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
-            let instance =
-                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
-            let attempt =
-                Self::create_raw_surface(&instance, raw_window_handle).and_then(|surface| {
+            let instance = if backends == wgpu::Backends::VULKAN {
+                WgpuContext::take_prewarmed_vulkan_instance()
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends)
+            });
+            let attempt = create_surface(&instance, raw_display_handle, raw_window_handle)
+                .and_then(|surface| {
                     WgpuContext::new(instance, &surface, compositor_gpu)
                         .map(|context| (context, surface))
                 });
@@ -2203,7 +2203,7 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let surface = create_surface(instance, window_handle.as_raw())?;
+        let surface = create_surface_with_instance_display(instance, window_handle.as_raw())?;
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -2317,6 +2317,10 @@ impl WgpuRenderer {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        let raw_display_handle = window
+            .display_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+            .as_raw();
 
         let surface = if needs_new_context {
             log::warn!("GPU device lost, recreating context...");
@@ -2333,7 +2337,7 @@ impl WgpuRenderer {
             std::thread::sleep(std::time::Duration::from_millis(350));
 
             let instance = WgpuContext::instance(Some(Box::new(window.clone())));
-            let surface = create_surface(&instance, window_handle.as_raw())?;
+            let surface = create_surface(&instance, raw_display_handle, window_handle.as_raw())?;
             let new_context =
                 WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
             *gpu_context.borrow_mut() = Some(new_context);
@@ -2341,7 +2345,7 @@ impl WgpuRenderer {
         } else {
             let ctx_ref = gpu_context.borrow();
             let instance = &ctx_ref.as_ref().unwrap().instance;
-            create_surface(instance, window_handle.as_raw())?
+            create_surface(instance, raw_display_handle, window_handle.as_raw())?
         };
 
         let config = WgpuSurfaceConfig {
@@ -2646,19 +2650,42 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
+/// Creates a surface for a window, naming its display explicitly so it works on instances
+/// created without one, such as a prewarmed Vulkan instance.
 #[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
+    raw_display_handle: raw_window_handle::RawDisplayHandle,
     raw_window_handle: raw_window_handle::RawWindowHandle,
 ) -> anyhow::Result<wgpu::Surface<'static>> {
+    create_surface_target(instance, Some(raw_display_handle), raw_window_handle)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_surface_with_instance_display(
+    instance: &wgpu::Instance,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+) -> anyhow::Result<wgpu::Surface<'static>> {
+    // Falls back to the display handle provided via InstanceDescriptor::display.
+    create_surface_target(instance, None, raw_window_handle)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_surface_target(
+    instance: &wgpu::Instance,
+    raw_display_handle: Option<raw_window_handle::RawDisplayHandle>,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+) -> anyhow::Result<wgpu::Surface<'static>> {
+    // Safety: The caller guarantees that the window handle is valid for the
+    // lifetime of this renderer. In practice, the RawWindow struct is created
+    // from the native window handles and the surface is dropped before the window.
     unsafe {
         instance
             .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                // Fall back to the display handle already provided via InstanceDescriptor::display.
-                raw_display_handle: None,
+                raw_display_handle,
                 raw_window_handle,
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
     }
 }
 
